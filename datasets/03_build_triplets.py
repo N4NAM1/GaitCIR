@@ -6,7 +6,7 @@ from collections import defaultdict
 # ================= 配置区域 =================
 META_FILE = './GaitCIR_RGB/meta_casiab_static.json'        # Step 02 的产出 (包含多样化的 view_text)
 TEMPLATE_FILE = './GaitCIR_RGB/templates_instruction.json' # Step 03 的产出 (包含去代词的模板)
-OUTPUT_TRAIN = './GaitCIR_RGB/casiab_cir_final_train.json'
+OUTPUT_TRAIN = './GaitCIR_RGB/casiab_cir_final.json'
 
 MAX_PAIRS_PER_ID = 800  # 采样强度 (根据你的需求调整，500-1000 适合 CASIA-B)
 

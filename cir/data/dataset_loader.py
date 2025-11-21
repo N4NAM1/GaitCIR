@@ -8,115 +8,139 @@ from torch.utils.data import Dataset
 from PIL import Image
 
 class GaitCIRDataset(Dataset):
-    def __init__(self, json_path, data_root, transform=None, subject_token="the person", return_static=False):
-        """
-        Args:
-            json_path (str): Step 04 生成的最终训练 JSON 路径
-            data_root (str): 数据集根目录 (包含 'RGB' 和 'Mask' 子文件夹)
-            transform (callable): CLIP 官方的预处理转换 (Resize, CenterCrop, Norm...)
-            subject_token (str): 将 {subject} 替换为什么？
-                                 - 普通训练用 "the person"
-                                 - 伪词训练用 "$S_*$"
-            return_static (bool): 是否同时返回静态描述 (用于辅助 Loss)
-        """
-        print(f"Loading dataset from {json_path} ...")
-        with open(json_path, 'r') as f:
-            self.data = json.load(f)
-            
-        self.rgb_root = os.path.join(data_root, 'RGB')
-        self.mask_root = os.path.join(data_root, 'silhouettes')
+    def __init__(self, 
+                 json_path,              # 主索引文件路径
+                 data_root,              # 图片数据根目录
+                 split_config_path=None, # 分割配置文件路径
+                 mode='train',           # 模式: 'train' 或 'test'
+                 max_frames=1,           # 采样帧数 (训练1, 测试8)
+                 transform=None, 
+                 subject_token="the person", 
+                 return_static=False):
+        
+        self.mode = mode
+        self.max_frames = max_frames
         self.transform = transform
         self.subject_token = subject_token
         self.return_static = return_static
-        
-        print(f"Dataset loaded. Total triplets: {len(self.data)}")
+        self.rgb_root = os.path.join(data_root, 'RGB')
+        self.mask_root = os.path.join(data_root, 'Mask')
 
-    def _load_random_frame(self, rel_seq_path):
-        """
-        从序列文件夹中随机读取一帧，并执行 Masked RGB 融合
-        """
-        # 1. 定位 RGB 序列文件夹
-        rgb_seq_dir = os.path.join(self.rgb_root, rel_seq_path)
-        
-        # 鲁棒性检查
-        if not os.path.isdir(rgb_seq_dir):
-            raise FileNotFoundError(f"Sequence dir not found: {rgb_seq_dir}")
+        # === 1. 加载主数据 ===
+        print(f"Loading Master JSON from {json_path} ...")
+        with open(json_path, 'r') as f:
+            all_data = json.load(f)
             
-        frames = [f for f in os.listdir(rgb_seq_dir) if f.endswith('.jpg')]
-        if not frames:
-            raise FileNotFoundError(f"No frames in {rgb_seq_dir}")
-
-        # 2. 随机采样一帧
-        frame_name = random.choice(frames)
-        
-        # 3. 读取 RGB (Raw)
-        rgb_path = os.path.join(rgb_seq_dir, frame_name)
-        rgb_img = cv2.imread(rgb_path)
-        if rgb_img is None: raise ValueError(f"Failed to load image: {rgb_path}")
-        rgb_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB) # 转 RGB
-
-        # 4. 读取对应的 Mask (文件名相同，后缀为 .png)
-        mask_name = frame_name.replace('.jpg', '.png')
-        mask_path = os.path.join(self.mask_root, rel_seq_path, mask_name)
-        
-        if os.path.exists(mask_path):
-            mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE) # 读取单通道
-            # 归一化到 0~1
-            mask_img = mask_img.astype(np.float32) / 255.0
-            # 扩展维度以匹配 RGB: (H, W) -> (H, W, 1)
-            mask_img = mask_img[:, :, np.newaxis]
+        # === 2. 应用分割过滤 (Split Filtering) ===
+        if split_config_path and os.path.exists(split_config_path):
+            print(f"Applying Split Config: {split_config_path} (Mode: {mode})")
+            with open(split_config_path, 'r') as f:
+                split_cfg = json.load(f)
             
-            # === 核心：生成 Masked RGB ===
-            # 背景变黑，保留彩色人体
-            masked_rgb = (rgb_img * mask_img).astype(np.uint8)
+            # 获取允许的 ID 列表 (转为 set 加速查找)
+            if mode == 'train':
+                allowed_ids = set(split_cfg['TRAIN_SET'])
+            elif mode == 'test':
+                allowed_ids = set(split_cfg['TEST_SET'])
+            else:
+                raise ValueError(f"Unknown mode: {mode}. Use 'train' or 'test'.")
+            
+            # 核心过滤逻辑：保留 sid 在允许列表里的条目
+            # 注意：确保 JSON 里的 sid 和 Config 里的格式一致 (都是字符串)
+            self.data = [item for item in all_data if str(item['sid']) in allowed_ids]
+            
+            print(f"✅ Filter Applied: {len(all_data)} -> {len(self.data)} triplets kept.")
         else:
-            # 如果没有 Mask (极少数异常情况)，降级使用 Raw RGB
-            masked_rgb = rgb_img
+            print("⚠️ Warning: No split config provided. Using ALL data!")
+            self.data = all_data
+
+    def _load_frames(self, rel_seq_path):
+        """加载帧逻辑 (保持不变)"""
+        rgb_seq_dir = os.path.join(self.rgb_root, rel_seq_path)
+        if not os.path.isdir(rgb_seq_dir): return []
+        
+        all_frames = sorted([f for f in os.listdir(rgb_seq_dir) if f.endswith('.jpg')])
+        if not all_frames: return []
+
+        # 根据模式决定采样策略
+        if self.mode == 'train':
+            # 训练：随机采样 (允许重复)
+            selected_frames = random.choices(all_frames, k=self.max_frames)
+        else:
+            # 测试：均匀采样
+            indices = np.linspace(0, len(all_frames) - 1, self.max_frames, dtype=int)
+            selected_frames = [all_frames[i] for i in indices]
+
+        images = []
+        for frame_name in selected_frames:
+            # 读取 RGB
+            rgb_path = os.path.join(rgb_seq_dir, frame_name)
+            rgb_img = cv2.imread(rgb_path)
+            if rgb_img is None: 
+                images.append(Image.new('RGB', (224, 224)))
+                continue
+            rgb_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB)
+
+            # 读取 Mask 并融合
+            mask_name = frame_name.replace('.jpg', '.png')
+            mask_path = os.path.join(self.mask_root, rel_seq_path, mask_name)
             
-        # 5. 转为 PIL Image (以便使用 torchvision transform)
-        return Image.fromarray(masked_rgb)
+            if os.path.exists(mask_path):
+                mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                # 二值化保险
+                _, mask_img = cv2.threshold(mask_img, 127, 255, cv2.THRESH_BINARY)
+                mask_img = mask_img.astype(np.float32) / 255.0
+                mask_img = mask_img[:, :, np.newaxis]
+                rgb_img = (rgb_img * mask_img).astype(np.uint8)
+            
+            pil_img = Image.fromarray(rgb_img)
+            if self.transform:
+                pil_img = self.transform(pil_img)
+            images.append(pil_img)
+            
+        return images
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        
         try:
-            # === 1. 加载图像 (Reference & Target) ===
-            ref_image = self._load_random_frame(item['ref']['seq_path'])
-            tar_image = self._load_random_frame(item['tar']['seq_path'])
+            ref_imgs = self._load_frames(item['ref']['seq_path'])
+            tar_imgs = self._load_frames(item['tar']['seq_path'])
             
-            # 应用 CLIP 的预处理
-            if self.transform:
-                ref_image = self.transform(ref_image)
-                tar_image = self.transform(tar_image)
-            
-            # === 2. 处理文本 (Instruction) ===
-            raw_caption = item['caption']
-            # 替换占位符: "Add a bag to {subject}." -> "Add a bag to the person."
-            caption = raw_caption.replace("{subject}", self.subject_token)
+            # 如果是训练单帧，直接解包
+            if self.mode == 'train' and self.max_frames == 1:
+                if ref_imgs: ref_out = ref_imgs[0]
+                else: raise ValueError("Empty ref frames")
+                
+                if tar_imgs: tar_out = tar_imgs[0]
+                else: raise ValueError("Empty tar frames")
+            else:
+                # 测试多帧，保持列表
+                ref_out = ref_imgs
+                tar_out = tar_imgs
+
+            caption = item['caption'].replace("{subject}", self.subject_token)
             
             result = {
-                "ref_img": ref_image,
-                "tar_img": tar_image,
+                "ref_imgs": ref_out,
+                "tar_imgs": tar_out,
                 "text": caption,
-                "task": item['task'] # 用于评估时区分任务类型
+                "task": item['task'],
+                # 传递元数据用于严格评测
+                "sid": str(item['sid']),
+                "cond": str(item['tar']['condition']),
+                "view": str(item['tar']['view'])
             }
             
-            # === 3. (可选) 处理静态描述 ===
-            # 如果你在训练配置里开了 use_aux_loss=True，这里就有用了
             if self.return_static:
-                # 替换占位符
-                ref_static = item['ref']['static_caption'].replace("{subject}", self.subject_token)
-                tar_static = item['tar']['static_caption'].replace("{subject}", self.subject_token)
-                
-                result["ref_text"] = ref_static
-                result["tar_text"] = tar_static
+                ref_st = item['ref'].get('static_caption', "").replace("{subject}", self.subject_token)
+                tar_st = item['tar'].get('static_caption', "").replace("{subject}", self.subject_token)
+                result["ref_text"] = ref_st
+                result["tar_text"] = tar_st
                 
             return result
             
         except Exception as e:
-            # 简单的错误处理：如果这就坏了，打印错误并随机返回另一个样本
-            # 防止训练中断
-            print(f"Error loading index {idx}: {e}")
+            # print(f"Error loading index {idx}: {e}")
             return self.__getitem__(random.randint(0, len(self.data)-1))
 
     def __len__(self):
