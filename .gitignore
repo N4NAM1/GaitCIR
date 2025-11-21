@@ -1,0 +1,34 @@
+# -------------------- 1. 数据集和大型文件 --------------------
+# 明确排除你提到的所有数据集目录
+/datasets/CASIA-B-Processed/
+/datasets/DatasetB-1/
+/datasets/DatasetB-2/
+
+# 模型权重文件
+/datasets/yolo11x-seg.pt
+# 排除所有模型权重文件 (常用格式)
+*.pth
+*.pt
+*.onnx
+
+# -------------------- 2. Python 编译文件 --------------------
+# Python 编译缓存文件
+__pycache__/
+*.pyc
+
+# -------------------- 3. IDE 和虚拟环境 --------------------
+# 虚拟环境目录（通用命名）
+.venv/
+env/
+venv/
+
+# 常用 IDE 和编辑器配置
+.vscode/             # VS Code 配置
+.idea/               # PyCharm/IntelliJ 配置
+
+# -------------------- 4. 运行时和日志文件 --------------------
+# 实验日志和中间结果
+logs/
+checkpoints/
+results/
+temp/
