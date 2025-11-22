@@ -13,7 +13,7 @@ from data.collate import get_collate_fn
 from utils.Metrics import compute_hierarchical_metrics
 
 # 显式指定测试哪个权重 (方便消融实验对比)
-TEST_CHECKPOINT = "./checkpoints/cycle_on/L_cycle_combiner_ep30.pth"
+TEST_CHECKPOINT = "./checkpoints/cycle_on/L_cycle_combiner_ep25.pth"
 
 @torch.no_grad()
 def evaluate():

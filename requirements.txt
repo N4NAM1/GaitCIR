@@ -1,0 +1,16 @@
+torch>=2.0.1
+torchvision>=0.15.2
+
+# HuggingFace 生态 (用于 CLIP 模型)
+transformers>=4.30.0
+
+# 计算机视觉与图像处理
+opencv-python
+numpy
+Pillow
+
+# 目标检测与分割 (用于数据预处理中的 YOLO)
+ultralytics
+
+# 实用工具
+tqdm

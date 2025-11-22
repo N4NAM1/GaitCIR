@@ -16,16 +16,10 @@ def test():
     print("🚀 开始 DataLoader 冒烟测试...")
     
     # ================= 配置区域 =================
-    # 1. 如果使用 Split Config (推荐)
     MASTER_JSON = '../../datasets/GaitCIR_RGB/casiab_cir_final.json'
     SPLIT_CONFIG = '../../datasets/GaitCIR_RGB/Split/CASIA-B.json'
     MODE = 'train' # 测试训练集数据
     
-    # 2. 如果使用物理分割后的 JSON (备选)
-    # MASTER_JSON = '../../datasets/GaitCIR_RGB/casiab_cir_train_split.json'
-    # SPLIT_CONFIG = None
-    # ===========================================
-
     # 初始化 Dataset
     dataset = GaitCIRDataset(
         json_path=MASTER_JSON,
