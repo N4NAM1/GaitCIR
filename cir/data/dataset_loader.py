@@ -9,14 +9,14 @@ from PIL import Image
 
 class GaitCIRDataset(Dataset):
     def __init__(self, 
-                 json_path,              # 主索引文件路径
-                 data_root,              # 图片数据根目录
-                 split_config_path=None, # 分割配置文件路径
-                 mode='train',           # 模式: 'train' 或 'test'
-                 max_frames=1,           # 采样帧数 (训练1, 测试8)
-                 transform=None, 
-                 subject_token="the person", 
-                 return_static=False):
+                 json_path,                  # 主索引文件路径
+                 data_root,                  # 图片数据根目录
+                 split_config_path=None,     # 分割配置文件路径
+                 mode='train',               # 模式: 'train' 或 'test'
+                 max_frames=1,               # 采样帧数 (训练1, 测试8)
+                 transform=None,             # 图像预处理函数
+                 subject_token="the person", # 替换文本中的主体标记
+                 return_static=False):       # 是否返回静态描述
         
         self.mode = mode
         self.max_frames = max_frames
@@ -27,13 +27,14 @@ class GaitCIRDataset(Dataset):
         self.mask_root = os.path.join(data_root, 'Mask')
 
         # === 1. 加载主数据 ===
+        print(f"Dataset Mode: {mode} | Max Frames: {max_frames}")
         print(f"Loading Master JSON from {json_path} ...")
         with open(json_path, 'r') as f:
             all_data = json.load(f)
             
         # === 2. 应用分割过滤 (Split Filtering) ===
         if split_config_path and os.path.exists(split_config_path):
-            print(f"Applying Split Config: {split_config_path} (Mode: {mode})")
+            print(f"Applying Split Config: {split_config_path}")
             with open(split_config_path, 'r') as f:
                 split_cfg = json.load(f)
             
@@ -55,7 +56,7 @@ class GaitCIRDataset(Dataset):
             self.data = all_data
 
     def _load_frames(self, rel_seq_path):
-        """加载帧逻辑 (保持不变)"""
+        """加载帧逻辑"""
         rgb_seq_dir = os.path.join(self.rgb_root, rel_seq_path)
         if not os.path.isdir(rgb_seq_dir): return []
         
@@ -77,11 +78,12 @@ class GaitCIRDataset(Dataset):
             rgb_path = os.path.join(rgb_seq_dir, frame_name)
             rgb_img = cv2.imread(rgb_path)
             if rgb_img is None: 
+                # 失败兜底：返回黑图防止 Crash
                 images.append(Image.new('RGB', (224, 224)))
                 continue
             rgb_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB)
 
-            # 读取 Mask 并融合
+            # 读取 Mask 并融合 (去除背景)
             mask_name = frame_name.replace('.jpg', '.png')
             mask_path = os.path.join(self.mask_root, rel_seq_path, mask_name)
             
@@ -106,31 +108,44 @@ class GaitCIRDataset(Dataset):
             ref_imgs = self._load_frames(item['ref']['seq_path'])
             tar_imgs = self._load_frames(item['tar']['seq_path'])
             
-            # 如果是训练单帧，直接解包
+            # 如果是训练单帧，直接解包为 Tensor (3, H, W)
+            # 如果是测试多帧，保持列表 List[Tensor]
             if self.mode == 'train' and self.max_frames == 1:
                 if ref_imgs: ref_out = ref_imgs[0]
-                else: raise ValueError("Empty ref frames")
+                else: raise ValueError(f"Empty ref frames for {item['ref']['seq_path']}")
                 
                 if tar_imgs: tar_out = tar_imgs[0]
-                else: raise ValueError("Empty tar frames")
+                else: raise ValueError(f"Empty tar frames for {item['tar']['seq_path']}")
             else:
-                # 测试多帧，保持列表
                 ref_out = ref_imgs
                 tar_out = tar_imgs
 
+            # === 处理文本 ===
+            # 正向指令
             caption = item['caption'].replace("{subject}", self.subject_token)
+            
+            # 逆向指令 (Cycle Loss 用)
+            # 【关键修改】使用 .get() 确保测试集或旧数据不报错，且处理 None 的情况
+            raw_inv = item.get('caption_inv', "")
+            if raw_inv:
+                caption_inv = raw_inv.replace("{subject}", self.subject_token)
+            else:
+                caption_inv = "" # 保持空字符串，collate 时会处理
             
             result = {
                 "ref_imgs": ref_out,
                 "tar_imgs": tar_out,
-                "text": caption,
-                "task": item['task'],
+                "text": caption,             # 正向文本指令
+                "text_inv": caption_inv,     # 逆向文本指令
+                "task": item['task'],        # 任务类型
+                
                 # 传递元数据用于严格评测
-                "sid": str(item['sid']),
-                "cond": str(item['tar']['condition']),
-                "view": str(item['tar']['view'])
+                "sid": str(item['sid']),                      # 序列 ID
+                "cond": str(item['tar']['condition']),        # 目标条件
+                "view": str(item['tar']['view'])              # 目标视角
             }
             
+            # 可选：返回静态描述 (用于辅助训练)
             if self.return_static:
                 ref_st = item['ref'].get('static_caption', "").replace("{subject}", self.subject_token)
                 tar_st = item['tar'].get('static_caption', "").replace("{subject}", self.subject_token)
@@ -140,7 +155,8 @@ class GaitCIRDataset(Dataset):
             return result
             
         except Exception as e:
-            # print(f"Error loading index {idx}: {e}")
+            # 遇到坏数据，随机重试另一个，防止训练中断
+            print(f"⚠️ Error loading index {idx} ({item['sid']}): {e}. Retrying...")
             return self.__getitem__(random.randint(0, len(self.data)-1))
 
     def __len__(self):

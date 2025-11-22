@@ -69,6 +69,7 @@ def test():
     
     # 打印文本 (检查占位符替换)
     print(f"📝 Instruction: {batch['text'][0]}")
+    print(f"📝 Instruction_inv: {batch['text_inv'][0]}")
     
     # 检查静态描述是否存在
     if 'ref_text' in batch:
