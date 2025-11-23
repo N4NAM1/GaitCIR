@@ -3,11 +3,11 @@ import torch
 
 # === 路径配置 ===
 PROJECT_ROOT = os.path.dirname('../') # 根目录
-DATASET_ROOT = os.path.join(PROJECT_ROOT, 'datasets/CASIA-B-Processed')
-JSON_ROOT = os.path.join(PROJECT_ROOT, 'datasets/GaitCIR_RGB')
+DATASET_ROOT = os.path.join(PROJECT_ROOT, '../../autodl-tmp/CASIA-B-Processed')
+JSON_ROOT = os.path.join(PROJECT_ROOT, 'datasets/GaitCIR_RGB_JSON')
 
-TRAIN_JSON = os.path.join(JSON_ROOT, 'casiab_cir_final.json')
-SPLIT_CONFIG = os.path.join(JSON_ROOT, 'Split/CASIA-B.json')
+TRAIN_JSON = os.path.join(JSON_ROOT, 'CASIA-B/casiab_cir_final.json')
+SPLIT_CONFIG = os.path.join(JSON_ROOT, 'CASIA-B/CASIA-B.json')
 
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'cir/checkpoints')
 
