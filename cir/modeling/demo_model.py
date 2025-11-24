@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import CLIPModel
 
 class Combiner(nn.Module):
@@ -8,66 +9,105 @@ class Combiner(nn.Module):
     """
     def __init__(self, input_dim=512, hidden_dim=2048):
         super().__init__()
-        # 输入是 图像特征 + 文本特征 拼接
         self.input_dim = input_dim * 2 
         
         self.layers = nn.Sequential(
             nn.Linear(self.input_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.5), # 防止过拟合
-            nn.Linear(hidden_dim, input_dim) # 映射回 CLIP 空间
+            nn.Dropout(0.5), 
+            nn.Linear(hidden_dim, input_dim) 
         )
         
-        # 学习一个残差系数 alpha (初始为 0，即初始状态下输出 = 原图特征)
+        # 残差系数
         self.alpha = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, img_feat, txt_feat):
-        # 1. 拼接
         combined = torch.cat((img_feat, txt_feat), dim=-1)
-        
-        # 2. 计算修改量 (Delta)
         delta = self.layers(combined)
-        
-        # 3. 残差融合
-        # Query = Image + alpha * Delta
+        # Residual Connection
         return img_feat + self.alpha * delta
 
 class GaitCIRModel(nn.Module):
     def __init__(self, model_id="openai/clip-vit-base-patch32"):
         super().__init__()
-        # 加载预训练 CLIP
+        print(f"Loading CLIP: {model_id}...")
         self.clip = CLIPModel.from_pretrained(model_id)
         
-        # 冻结 CLIP 所有参数
+        # ❄️ 冻结 CLIP 视觉和文本部分，只训练 Combiner
         for param in self.clip.parameters():
             param.requires_grad = False
             
-        # 初始化 Combiner
+        # 初始化组件
         self.feature_dim = self.clip.projection_dim # 512
         self.combiner = Combiner(self.feature_dim)
         
-        # 这是一个可学习的温度系数，用于 Loss 计算
-        self.logit_scale = nn.Parameter(torch.ones([]) * 2.6592) # log(1/0.07)
+        # 可学习的温度系数
+        self.logit_scale = nn.Parameter(torch.ones([]) * 2.6592)
 
     def extract_img_feature(self, pixel_values):
+        """ 单帧特征提取: [N, 3, H, W] -> [N, 512] """
         with torch.no_grad():
             feat = self.clip.get_image_features(pixel_values)
         return feat / feat.norm(dim=-1, keepdim=True)
 
     def extract_txt_feature(self, input_ids, attention_mask):
+        """ 文本特征提取: [B, L] -> [B, 512] """
         with torch.no_grad():
             feat = self.clip.get_text_features(input_ids, attention_mask)
         return feat / feat.norm(dim=-1, keepdim=True)
 
-    def forward(self, ref_pixels, input_ids, attention_mask):
-        """训练时的前向传播：计算 Query Embedding"""
-        # 1. 提取冻结特征
-        ref_feat = self.extract_img_feature(ref_pixels)
+    def aggregate_features(self, inputs, batch_size, frames_num):
+        """
+        🔥 核心升级：GaitSet 风格的时序聚合 (Set Pooling)
+        支持输入 'Image Tensor' 或 'Feature Tensor'，自动处理。
+        """
+        # 1. 如果输入是图片 [B*T, 3, H, W]，先提取特征
+        if inputs.dim() == 4:
+            features = self.extract_img_feature(inputs) # -> [B*T, 512]
+        else:
+            features = inputs # 已经是 [B*T, 512] 或 [B, T, 512]
+
+        # 2. 统一维度 -> [B, T, D]
+        if features.dim() == 2:
+            features = features.view(batch_size, frames_num, -1)
+            
+        # 3. Max Pooling (GaitSet 也是用的 Max)
+        # max() 返回 (values, indices)，我们需要 values
+        agg_feat = features.max(dim=1)[0] # -> [B, 512]
+        
+        # 4. ⚠️ 再次归一化 (Pooling 后模长会变，必须 Re-Norm)
+        agg_feat = agg_feat / agg_feat.norm(dim=-1, keepdim=True)
+        
+        return agg_feat
+
+    def forward(self, ref_input, input_ids, attention_mask):
+        """
+        训练前向传播：计算 Query Embedding
+        自动判断 ref_input 是图片还是特征
+        """
+        batch_size = input_ids.size(0)
+        
+        # === 1. 视觉处理 (Extract + Aggregate) ===
+        if ref_input.dim() == 4:
+            # Image Mode: [N, 3, H, W] -> 需要计算 T
+            total_imgs = ref_input.size(0)
+            frames_num = total_imgs // batch_size
+            ref_agg = self.aggregate_features(ref_input, batch_size, frames_num)
+            
+        elif ref_input.dim() == 3:
+            # Feature Mode: [B, T, D]
+            frames_num = ref_input.size(1)
+            ref_agg = self.aggregate_features(ref_input, batch_size, frames_num)
+            
+        else:
+            raise ValueError(f"Unknown input shape: {ref_input.shape}")
+
+        # === 2. 文本处理 ===
         txt_feat = self.extract_txt_feature(input_ids, attention_mask)
         
-        # 2. 融合 (这一步有梯度)
-        query_feat = self.combiner(ref_feat, txt_feat)
+        # === 3. 融合 (Ref + Text -> Query) ===
+        query_feat = self.combiner(ref_agg, txt_feat)
         
-        # 归一化，准备算 Cosine Similarity
+        # 输出归一化
         return query_feat / query_feat.norm(dim=-1, keepdim=True)

@@ -1,77 +1,181 @@
 import torch
-import torch.nn.functional as F
 import numpy as np
+from collections import defaultdict
 
-def compute_hierarchical_metrics(query_feats, gallery_feats, q_meta, g_meta, tasks):
+def compute_mAP_vectorized(sim_mat, is_match):
     """
-    计算分层指标 (Hierarchical Metrics)
-    q_meta, g_meta: list of dict {'sid', 'cond', 'view'}
+    [GPU 加速] 计算 Mean Average Precision (mAP)
+    适用于单 GT 和多 GT (Soft Match) 的情况。
+    
+    Args:
+        sim_mat: [N_query, N_gallery] 相似度矩阵 (越大越好)
+        is_match: [N_query, N_gallery] Boolean/Int (Ground Truth 掩码)
     """
-    print("🚀 [Utils] 正在计算分层相似度矩阵...")
+    # 1. 排序: 相似度从高到低
+    # descending=True
+    scores, indices = torch.sort(sim_mat, dim=1, descending=True)
     
-    # 1. 归一化 & 转 CPU
-    query_feats = F.normalize(query_feats, dim=-1).cpu()
-    gallery_feats = F.normalize(gallery_feats, dim=-1).cpu()
+    # 2. 根据排序结果重排 Ground Truth
+    # gather: 将 is_match 按照 indices 的顺序重新排列
+    # gts[i][j] = 1 表示第 i 个 Query 的第 j 名预测结果是正确的
+    gts = torch.gather(is_match.float(), 1, indices)
     
-    # 2. 相似度与排序
-    sim_matrix = query_feats @ gallery_feats.T
-    _, indices = torch.sort(sim_matrix, dim=1, descending=True)
+    # 3. 计算 Precision
+    # cumsum: 计算每一位的累计正确数 (即 TP @ k)
+    cumsum = torch.cumsum(gts, dim=1)
     
-    # 3. 准备元数据向量
-    q_sid = np.array([m['sid'] for m in q_meta])
-    g_sid = np.array([m['sid'] for m in g_meta])
-    q_cond = np.array([m['cond'] for m in q_meta])
-    g_cond = np.array([m['cond'] for m in g_meta])
-    q_view = np.array([m['view'] for m in q_meta])
-    g_view = np.array([m['view'] for m in g_meta])
+    # ranks: 生成排名 [1, 2, 3, ..., M]
+    ranks = torch.arange(1, gts.size(1) + 1, device=gts.device).float().unsqueeze(0)
     
-    # 4. 构建 Ground Truth 矩阵
-    gt_id = (q_sid[:, None] == g_sid[None, :])
-    # Strict: ID + Cond + View
-    gt_strict = gt_id & (q_cond[:, None] == g_cond[None, :]) & (q_view[:, None] == g_view[None, :])
-    # Soft: ID + Cond
-    gt_soft = gt_id & (q_cond[:, None] == g_cond[None, :])
+    # precision @ k = (TP @ k) / k
+    precision = cumsum / ranks
     
-    gt_id_t = torch.from_numpy(gt_id)
-    gt_strict_t = torch.from_numpy(gt_strict)
-    gt_soft_t = torch.from_numpy(gt_soft)
+    # 4. 计算 Average Precision (AP)
+    # AP = sum(precision * is_relevant) / num_total_relevant
+    # 只有相关位置的 precision 才参与求和
+    ap_sum = (precision * gts).sum(dim=1)
+    num_relevant = gts.sum(dim=1)
     
-    # 5. 内部计算函数
-    def calc_recall(gt_matrix, topk_indices, mask):
-        indices_masked = topk_indices[mask]
-        gt_masked = gt_matrix[mask]
-        if gt_masked.size(0) == 0: return 0.0, 0.0, 0.0
-        
-        hits = torch.gather(gt_masked, 1, indices_masked)
-        r1 = hits[:, :1].any(dim=1).float().mean().item() * 100
-        r5 = hits[:, :5].any(dim=1).float().mean().item() * 100
-        r10 = hits[:, :10].any(dim=1).float().mean().item() * 100
-        return r1, r5, r10
+    # 5. 避免除以 0 (对于没有任何正确答案的 Query，AP=0)
+    mask = num_relevant > 0
+    ap = torch.zeros_like(ap_sum)
+    ap[mask] = ap_sum[mask] / num_relevant[mask]
+    
+    # 6. Mean AP
+    return ap.mean().item()
 
-    # 6. 统计
+def compute_rank_k_vectorized(sim_mat, is_match, ks=[1, 5, 10]):
+    """
+    [GPU 加速] 计算 R@K (CMC Rank-k / Hit Rate)
+    定义：只要 Top-K 结果中包含 *至少一个* 正确答案，就算命中 (Hit)。
+    """
+    # 1. 排序
+    _, indices = torch.sort(sim_mat, dim=1, descending=True)
+    
+    # 2. 重排 GT
+    gts = torch.gather(is_match.float(), 1, indices)
+    
     results = {}
-    unique_tasks = set(tasks)
-    unique_tasks.add("Overall")
-    top10_indices = indices[:, :10]
-    tasks_tensor = np.array(tasks)
-    
-    for task_name in unique_tasks:
-        if task_name == "Overall":
-            mask = torch.ones(len(tasks), dtype=torch.bool)
-        else:
-            mask = torch.from_numpy(tasks_tensor == task_name)
+    for k in ks:
+        if k > gts.size(1):
+            results[f'R{k}'] = 100.0
+            continue
             
-        if mask.sum() == 0: continue
+        # 取前 K 列
+        top_k = gts[:, :k]
         
-        id_r1, id_r5, id_r10 = calc_recall(gt_id_t, top10_indices, mask)
-        st_r1, st_r5, st_r10 = calc_recall(gt_strict_t, top10_indices, mask)
-        so_r1, so_r5, so_r10 = calc_recall(gt_soft_t, top10_indices, mask)
+        # 只要行和 > 0，说明命中了至少 1 个
+        hits = (top_k.sum(dim=1) > 0).float()
         
-        results[task_name] = {
-            "Count": mask.sum().item(),
-            "ID":     {"R1": id_r1, "R5": id_r5},
-            "Strict": {"R1": st_r1, "R5": st_r5, "R10": st_r10},
-            "Soft":   {"R1": so_r1, "R5": so_r5}
-        }
+        # 平均命中率
+        results[f'R{k}'] = hits.mean().item() * 100.0
         
     return results
+
+def _compute_on_device(device, q_feats, g_feats, q_meta, g_meta, q_tasks):
+    """
+    内部计算函数：负责数据搬运、Mask 生成和指标计算
+    """
+    # 1. 特征搬运与归一化
+    q_feats = q_feats.to(device)
+    g_feats = g_feats.to(device)
+    
+    q_feats = torch.nn.functional.normalize(q_feats, p=2, dim=1)
+    g_feats = torch.nn.functional.normalize(g_feats, p=2, dim=1)
+    
+    # 2. 计算相似度矩阵
+    sim_mat = torch.mm(q_feats, g_feats.t())
+    
+    # 3. 提取元数据 (CPU Numpy 处理字符串，生成 Bool Mask 后转 GPU)
+    q_sids = np.array([m['sid'] for m in q_meta])
+    g_sids = np.array([m['sid'] for m in g_meta])
+    
+    q_views = np.array([m['view'] for m in q_meta])
+    g_views = np.array([m['view'] for m in g_meta])
+    
+    # === 🔥 核心修改：模糊匹配 Condition ===
+    # 忽略后缀 (如 -01, -02)，只保留类别前缀 (nm, bg, cl)
+    # 这样 "bg-01" 和 "bg-02" 会被视为相同的 Soft Label
+    q_conds = np.array([str(m['cond']).split('-')[0] for m in q_meta])
+    g_conds = np.array([str(m['cond']).split('-')[0] for m in g_meta])
+    
+    # 4. 生成 GPU 布尔掩码 (Ground Truth)
+    # Broadcasting: [N, 1] == [1, M] -> [N, M]
+    match_id = torch.from_numpy(q_sids[:, None] == g_sids[None, :]).to(device)
+    match_cond = torch.from_numpy(q_conds[:, None] == g_conds[None, :]).to(device)
+    match_view = torch.from_numpy(q_views[:, None] == g_views[None, :]).to(device)
+    
+    # 5. 分任务计算
+    task_groups = defaultdict(list)
+    for idx, task in enumerate(q_tasks):
+        task_groups[task].append(idx)
+        
+    # 增加 Overall 组
+    if "Overall" not in task_groups:
+        task_groups["Overall"] = list(range(len(q_feats)))
+        
+    final_results = {}
+    
+    for task, indices in task_groups.items():
+        if len(indices) == 0: continue
+        
+        # 提取当前任务的子集索引
+        indices_t = torch.tensor(indices, device=device)
+        
+        # 切片矩阵
+        sub_sim = sim_mat[indices_t]
+        sub_match_id = match_id[indices_t]
+        sub_match_cond = match_cond[indices_t]
+        sub_match_view = match_view[indices_t]
+        
+        # === 定义匹配标准 ===
+        
+        # A. Strict: 严格匹配 (人对 + 状态对 + 视角对)
+        # 这里的状态也是模糊匹配后的 (bg)，这没问题，因为 Strict 主要靠 View 来约束唯一性
+        gt_strict = sub_match_id & sub_match_cond & sub_match_view
+        
+        # B. Soft: 宽松匹配 (人对 + 状态对) -> 忽略视角，忽略序列号差异
+        # 这下 bg-01 搜出 bg-02 也能算对了！
+        gt_soft = sub_match_id & sub_match_cond
+        
+        # C. ID: 身份匹配 (人对)
+        gt_id = sub_match_id
+        
+        # === 计算指标 ===
+        metrics = {'Count': len(indices)}
+        
+        # 1. Strict
+        res_strict = compute_rank_k_vectorized(sub_sim, gt_strict)
+        res_strict['mAP'] = compute_mAP_vectorized(sub_sim, gt_strict) * 100
+        metrics['Strict'] = res_strict
+        
+        # 2. Soft
+        res_soft = compute_rank_k_vectorized(sub_sim, gt_soft)
+        res_soft['mAP'] = compute_mAP_vectorized(sub_sim, gt_soft) * 100
+        metrics['Soft'] = res_soft
+        
+        # 3. ID
+        res_id = compute_rank_k_vectorized(sub_sim, gt_id)
+        res_id['mAP'] = compute_mAP_vectorized(sub_sim, gt_id) * 100
+        metrics['ID'] = res_id
+        
+        final_results[task] = metrics
+        
+    return final_results
+
+def compute_hierarchical_metrics(q_feats, g_feats, q_meta, g_meta, q_tasks):
+    """
+    对外接口：自动显存保护
+    """
+    try:
+        if torch.cuda.is_available():
+            return _compute_on_device(torch.device("cuda"), q_feats, g_feats, q_meta, g_meta, q_tasks)
+        else:
+            return _compute_on_device(torch.device("cpu"), q_feats, g_feats, q_meta, g_meta, q_tasks)
+    except RuntimeError as e:
+        if "out of memory" in str(e):
+            print("\n⚠️ [Metrics] GPU OOM! Swapping to CPU for evaluation...")
+            torch.cuda.empty_cache()
+            return _compute_on_device(torch.device("cpu"), q_feats, g_feats, q_meta, g_meta, q_tasks)
+        else:
+            raise e
