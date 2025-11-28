@@ -4,9 +4,9 @@ from tqdm import tqdm
 from collections import defaultdict
 
 # ================= 配置区域 =================
-META_FILE = './GaitCIR_RGB_JSON/meta_casiab_static.json'        
-TEMPLATE_FILE = './GaitCIR_RGB_JSON/templates_instruction.json' 
-OUTPUT_TRAIN = './GaitCIR_RGB_JSON/CASIA-B/casiab_cir_final.json'
+META_FILE = '../GaitCIR_RGB_JSON/meta_casiab_static.json'        
+TEMPLATE_FILE = '../GaitCIR_RGB_JSON/templates_instruction.json' 
+OUTPUT_TRAIN = '../GaitCIR_RGB_JSON/CASIA-B/casiab_cir_final.json'
 
 MAX_PAIRS_PER_ID = 800  # 采样强度
 

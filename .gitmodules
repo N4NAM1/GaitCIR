@@ -1,0 +1,3 @@
+[submodule "cir/OpenGait"]
+	path = cir/OpenGait
+	url = https://github.com/N4NAM1/OpenGait
