@@ -14,7 +14,7 @@ DATASET_ROOT = '/root/autodl-tmp/CASIA-B-Processed'
 
 # JSON 索引文件路径
 # 注意：这里我保留了你的结构，指向 datasets/GaitCIR_RGB_JSON
-JSON_ROOT = os.path.join(PROJECT_ROOT, 'datasets/GaitCIR_RGB_JSON')
+JSON_ROOT = os.path.join(PROJECT_ROOT, 'datasets/CASIA-B_RGB_JSON')
 TRAIN_JSON = os.path.join(JSON_ROOT, 'CASIA-B/casiab_cir_final.json')
 SPLIT_CONFIG = os.path.join(JSON_ROOT, 'CASIA-B/CASIA-B.json')
 
