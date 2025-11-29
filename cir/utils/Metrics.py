@@ -11,12 +11,10 @@ def compute_mAP_vectorized(sim_mat, is_match):
         sim_mat: [N_query, N_gallery] 相似度矩阵 (越大越好)
         is_match: [N_query, N_gallery] Boolean/Int (Ground Truth 掩码)
     """
-    # 1. 排序: 相似度从高到低
-    # descending=True
+    # 1. 排序: 相似度从高到低 (descending=True)
     scores, indices = torch.sort(sim_mat, dim=1, descending=True)
     
     # 2. 根据排序结果重排 Ground Truth
-    # gather: 将 is_match 按照 indices 的顺序重新排列
     # gts[i][j] = 1 表示第 i 个 Query 的第 j 名预测结果是正确的
     gts = torch.gather(is_match.float(), 1, indices)
     
@@ -93,9 +91,7 @@ def _compute_on_device(device, q_feats, g_feats, q_meta, g_meta, q_tasks):
     q_views = np.array([m['view'] for m in q_meta])
     g_views = np.array([m['view'] for m in g_meta])
     
-    # === 🔥 核心修改：模糊匹配 Condition ===
-    # 忽略后缀 (如 -01, -02)，只保留类别前缀 (nm, bg, cl)
-    # 这样 "bg-01" 和 "bg-02" 会被视为相同的 Soft Label
+    # === 关键操作：模糊匹配 Condition (忽略序列号，例如 'bg-01' -> 'bg') ===
     q_conds = np.array([str(m['cond']).split('-')[0] for m in q_meta])
     g_conds = np.array([str(m['cond']).split('-')[0] for m in g_meta])
     
@@ -128,16 +124,27 @@ def _compute_on_device(device, q_feats, g_feats, q_meta, g_meta, q_tasks):
         sub_match_cond = match_cond[indices_t]
         sub_match_view = match_view[indices_t]
         
-        # === 定义匹配标准 ===
+        # === 定义匹配标准 (Soft 匹配根据任务动态调整) ===
         
-        # A. Strict: 严格匹配 (人对 + 状态对 + 视角对)
-        # 这里的状态也是模糊匹配后的 (bg)，这没问题，因为 Strict 主要靠 View 来约束唯一性
+        # A. Strict: 严格匹配 (ID & 模糊化 Condition & View)
+        # 你的要求：ID 对 + 语义状态对 + 视角对，忽略序列号。
         gt_strict = sub_match_id & sub_match_cond & sub_match_view
         
-        # B. Soft: 宽松匹配 (人对 + 状态对) -> 忽略视角，忽略序列号差异
-        # 这下 bg-01 搜出 bg-02 也能算对了！
-        gt_soft = sub_match_id & sub_match_cond
-        
+        # B. Soft: 宽松匹配 (根据任务聚焦指令要求)
+        if task == 'viewpoint_change':
+            # 视角任务：只需要 ID 对 + 视角对 (忽略属性差异)
+            gt_soft = sub_match_id & sub_match_view
+        elif task == 'attribute_change':
+            # 属性任务：只需要 ID 对 + 属性/状态对 (忽略视角差异)
+            gt_soft = sub_match_id & sub_match_cond
+        elif task == 'composite_change':
+            # 复合任务：需要 ID 对 + 属性/状态对 + 视角对
+            # Soft在于它仅忽略序列号。
+            gt_soft = sub_match_id & sub_match_cond & sub_match_view
+        else:
+            # Overall 或其他任务：使用最通用的 Soft 定义 (ID + 属性)
+            gt_soft = sub_match_id & sub_match_cond
+            
         # C. ID: 身份匹配 (人对)
         gt_id = sub_match_id
         
@@ -168,11 +175,14 @@ def compute_hierarchical_metrics(q_feats, g_feats, q_meta, g_meta, q_tasks):
     对外接口：自动显存保护
     """
     try:
+        # 尝试使用 CUDA
         if torch.cuda.is_available():
             return _compute_on_device(torch.device("cuda"), q_feats, g_feats, q_meta, g_meta, q_tasks)
         else:
+            # 使用 CPU
             return _compute_on_device(torch.device("cpu"), q_feats, g_feats, q_meta, g_meta, q_tasks)
     except RuntimeError as e:
+        # 捕捉 CUDA 内存不足错误，切换到 CPU
         if "out of memory" in str(e):
             print("\n⚠️ [Metrics] GPU OOM! Swapping to CPU for evaluation...")
             torch.cuda.empty_cache()

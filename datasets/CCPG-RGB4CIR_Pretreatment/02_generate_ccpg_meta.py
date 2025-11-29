@@ -58,7 +58,7 @@ def generate_ccpg_meta_aligned(data_root, output_path):
                     
                     # 2. 简单的静态描述规则 (粗粒度)
                     # 虽然我们未来要用 MLLM，但现在先填一个占位符保证代码能跑
-                    base_cap = "A person walking"
+                    base_cap = "{{Subject}} walking"
                     if "BG" in status:
                         base_cap += " carrying a bag"
                     if "U" in status and "U0" not in status:
