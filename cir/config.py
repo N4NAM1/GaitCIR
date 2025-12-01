@@ -19,14 +19,17 @@ TRAIN_JSON = os.path.join(JSON_ROOT, 'CASIA-B/casiab_cir_final.json')
 SPLIT_CONFIG = os.path.join(JSON_ROOT, 'CASIA-B/CASIA-B.json')
 
 # 输出目录 (Logs, Checkpoints)
-OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'cir//checkpoint/MLP_Unmasked_alpha0.5_cos')
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'cir/checkpoint/MLP_Unmasked_alpha0.5_cos')
 
 # ==============================================================================
 # 2. 特征缓存配置 (Feature Caching)
-# ==============================================================================
+# ======================================vc========================================
 # 预提取特征的存储位置
 FEATURE_ROOT_MASKED = os.path.join(DATASET_ROOT, 'CLIP_feature_Masked')
 FEATURE_ROOT_UNMASKED = os.path.join(DATASET_ROOT, 'CLIP_feature_Unmasked')
+
+# 默认数据集名称
+DATASET_NAME = "CASIA-B"
 
 # 【核心开关】默认使用的特征路径
 # main.py 中的 --unmasked 参数可以覆盖这里的设置
@@ -34,7 +37,7 @@ FEATURE_ROOT = FEATURE_ROOT_MASKED
 
 # 默认模式开关
 USE_FEATURES = True   # 默认读取 .pt 特征 (速度快)
-USE_MASK = False       # 默认是 Masked 模式 (仅用于 Log 或 读图模式下的预处理)
+USE_MASK = False       # 默认是 UNMasked 模式 (仅用于 Log 或 读图模式下的预处理)
 
 # ==============================================================================
 # 3. 模型与计算配置 (Model & Hardware)
@@ -57,8 +60,8 @@ EPOCHS = 15
 WARMUP_STEPS = 100
 
 # 采样配置 (GaitSet 风格)
-TRAIN_MAX_FRAMES = 16  # 训练时：随机采样 30 帧进行聚合
-TEST_MAX_FRAMES = all   # 测试时：使用 N 帧 (或全部) 获得更稳健特征
+TRAIN_MAX_FRAMES = 16  # 训练时：随机采样 16 帧进行聚合
+TEST_MAX_FRAMES = "all"   # 测试时：使用 N 帧 (或全部) 获得更稳健特征
 
 # ==============================================================================
 # 5. 辅助配置 (Misc)

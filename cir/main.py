@@ -136,6 +136,7 @@ def train_engine(model, processor, args):
         json_path=cfg.TRAIN_JSON, 
         data_root=cfg.DATASET_ROOT, 
         split_config_path=cfg.SPLIT_CONFIG,
+        dataset_name=cfg.DATASET_NAME, # 🔥 [修正] 必传参数
         mode='train', 
         max_frames=cfg.TRAIN_MAX_FRAMES, 
         use_features=cfg.USE_FEATURES,
@@ -169,7 +170,6 @@ def train_engine(model, processor, args):
         
         total_loss = 0
         
-        # 【修改点 1】更详细的训练进度条标题
         header = f"🚀 Train Ep {epoch+1}/{cfg.EPOCHS}"
         iterator = tqdm(loader, desc=header) if dist.get_rank() == 0 else loader
         
@@ -229,7 +229,6 @@ def train_engine(model, processor, args):
             
             total_loss += loss.item()
             
-            # 【修改点 2】增加 LR 显示
             if dist.get_rank() == 0:
                 current_lr = optimizer.param_groups[0]['lr']
                 iterator.set_postfix({
@@ -272,7 +271,6 @@ def print_report(metrics):
             # 2. Soft 指标 (宽松匹配)
             if 'Soft' in res:
                 so = res['Soft']
-                # Soft 通常没有 R1/R5 那么强的参考意义，但 mAP 很重要
                 print(f"  {'':<20} | {'Soft':<8} | {so['R1']:>6.1f} | {so['R5']:>6.1f} | {so['R10']:>6.1f} | {so['mAP']:>6.1f}")
             
             # 3. ID 指标 (是否找对了人)
@@ -295,6 +293,7 @@ def test_engine(model, processor, args):
         json_path=cfg.TRAIN_JSON, 
         data_root=cfg.DATASET_ROOT, 
         split_config_path=cfg.SPLIT_CONFIG,
+        dataset_name=cfg.DATASET_NAME, # 🔥 [修正] 必传参数，用于处理不同数据集路径逻辑
         mode='test', 
         max_frames=cfg.TEST_MAX_FRAMES, 
         use_features=cfg.USE_FEATURES,
@@ -316,27 +315,25 @@ def test_engine(model, processor, args):
         if batch is None: continue
         ref, tar, ids, mask, tasks, meta = batch
         
-        # 1. 文本数据 (总是 Tensor，直接搬运)
+        # 1. 文本数据
         ids, mask = ids.to(cfg.DEVICE), mask.to(cfg.DEVICE)
         
         # 获取原始模型 (解开 DDP 包装)
         raw_model = model.module if hasattr(model, 'module') else model
         
-        # 2. 视觉数据处理 (核心修复点)
+        # 2. 视觉数据处理 (兼容 Feature / Image)
         if cfg.USE_FEATURES:
-            # 此时 ref/tar 是 List[Tensor]，不能直接 .to(device)
+            # 特征模式: [T, 512]
             if isinstance(ref, list):
                 ref_agg_list = []
                 tar_agg_list = []
                 
                 # 逐个样本处理 (处理变长序列)
                 for r, t in zip(ref, tar):
-                    # 搬运单样本 [T, 512] -> GPU
                     r = r.to(cfg.DEVICE)
                     t = t.to(cfg.DEVICE)
                     
                     # 聚合: [T, 512] -> [1, T, 512] -> [1, 512]
-                    # 注意: unsqueeze(0) 模拟 Batch=1
                     r_agg = raw_model.aggregate_features(r.unsqueeze(0), 1, r.size(0))
                     t_agg = raw_model.aggregate_features(t.unsqueeze(0), 1, t.size(0))
                     
@@ -347,13 +344,26 @@ def test_engine(model, processor, args):
                 ref_agg = torch.cat(ref_agg_list, dim=0)
                 tar_agg = torch.cat(tar_agg_list, dim=0)
             else:
-                # 兜底：如果是 Tensor (例如 batch_size=1 被自动 stack 了)
+                # 兜底：如果是 Tensor
                 ref, tar = ref.to(cfg.DEVICE), tar.to(cfg.DEVICE)
                 ref_agg = raw_model.aggregate_features(ref, ref.size(0), ref.size(1))
                 tar_agg = raw_model.aggregate_features(tar, tar.size(0), tar.size(1))
         else:
-            # Image Mode (略，保持原样或按需实现)
-            pass
+            # 🔥 [修正] Image Mode (Raw RGB): [B, T, C, H, W]
+            ref = ref.to(cfg.DEVICE)
+            tar = tar.to(cfg.DEVICE)
+            
+            # 处理 Reference
+            B_r, T_r, C, H, W = ref.shape
+            ref_flat = ref.view(-1, C, H, W)
+            ref_feat = raw_model.extract_img_feature(ref_flat) # [B*T, 512]
+            ref_agg = raw_model.aggregate_features(ref_feat, B_r, T_r) # [B, 512]
+            
+            # 处理 Target
+            B_t, T_t, _, _, _ = tar.shape
+            tar_flat = tar.view(-1, C, H, W)
+            tar_feat = raw_model.extract_img_feature(tar_flat)
+            tar_agg = raw_model.aggregate_features(tar_feat, B_t, T_t)
 
         # 3. 文本特征
         txt_f = raw_model.extract_txt_feature(ids, mask)

@@ -1,7 +1,7 @@
 import os
 import json
 import random
-import cv2
+import pickle
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -9,24 +9,26 @@ from PIL import Image
 
 class GaitCIRDataset(Dataset):
     """
-    通用数据加载器 (GaitCIR Universal Loader)
-    功能：
-      1. 支持 Image Mode (读生图 + 可选去背景)
-      2. 支持 Feature Mode (读缓存特征，极速训练)
-      3. 支持 OpenGait 风格的采样策略
+    Dual-PKL GaitCIR Loader (Final Robust Version)
+    
+    修复汇总:
+      1. 路径适配: 支持 CASIA-B, CCPG, SUSTech1K
+      2. 维度修复: 自动处理 Channel-First (3,H,W) -> (H,W,3)
+      3. 采样修复: 支持 max_frames="all" 模式
     """
     def __init__(self, 
-                 json_path,                  # 主索引 JSON 路径
-                 data_root,                  # 原始图片根目录 (Image Mode 用)
-                 split_config_path=None,     # 数据集划分配置
-                 mode='train',               # 'train' 或 'test'
-                 max_frames=4,               # 采样帧数
-                 transform=None,             # 图像预处理 (Image Mode 用)
-                 subject_token="the person", # 文本 Token 替换
-                 return_static=False,        # 是否返回静态描述文本
-                 use_features=False,         # 是否使用预提取特征
-                 feature_root=None,          # 特征文件根目录
-                 use_mask=True               # 是否去背景 (Image Mode 生效)
+                 json_path, 
+                 data_root, 
+                 dataset_name,               # "CASIA-B", "CCPG", "SUSTech1K"
+                 split_config_path=None, 
+                 mode='train',
+                 max_frames=4,
+                 use_features=False, 
+                 feature_root=None, 
+                 use_mask=True,
+                 transform=None,
+                 subject_token="the person",
+                 return_static=False
                  ):       
         
         self.mode = mode
@@ -35,154 +37,233 @@ class GaitCIRDataset(Dataset):
         self.subject_token = subject_token
         self.return_static = return_static
         
-        # === 模式配置 ===
+        # === 1. 路径与模式配置 ===
         self.use_features = use_features
         self.feature_root = feature_root
         self.use_mask = use_mask
+        self.dataset_name = dataset_name.upper()
         
-        # 路径检查
+        # 定义数据集的文件名策略
+        if self.dataset_name == "CCPG":
+            self.filename_replacement = {"rgb": "rgbs", "mask": "masks"}
+        elif self.dataset_name == "SUSTECH1K":
+            self.filename_replacement = "scan"
+        else:
+            self.filename_replacement = "append_pkl" 
+
         if not self.use_features:
             self.rgb_root = os.path.join(data_root, 'RGB')
             self.mask_root = os.path.join(data_root, 'Mask')
-        else:
-            if self.feature_root is None:
-                # 这里的路径检查可以防止空指针
-                raise ValueError("❌ [Loader] Feature Root must be provided in Feature Mode!")
 
-        # === 1. 加载索引数据 ===
+            if not os.path.exists(self.rgb_root):
+                raise ValueError(f"❌ RGB root not found: {self.rgb_root}")
+            
+            if self.use_mask and not os.path.exists(self.mask_root):
+                print(f"⚠️ Mask enabled but not found: {self.mask_root}. Disabling mask.")
+                self.use_mask = False
+
+        # === 2. 加载索引 ===
         print(f"   Loading Index: {json_path}")
         with open(json_path, 'r') as f:
             all_data = json.load(f)
             
-        # === 2. 数据划分过滤 (Split Filtering) ===
         if split_config_path and os.path.exists(split_config_path):
             with open(split_config_path, 'r') as f:
                 split_cfg = json.load(f)
-            
-            # 根据模式选择对应的 ID 列表
             subset_key = 'TRAIN_SET' if mode == 'train' else 'TEST_SET'
             allowed_ids = set(split_cfg[subset_key])
-            
-            # 过滤数据
             self.data = [item for item in all_data if str(item['sid']) in allowed_ids]
             print(f"✅ Filter Applied: {len(all_data)} -> {len(self.data)} triplets kept.")
         else:
             self.data = all_data
 
-    def _load_frames(self, rel_seq_path):
-        """ [模式 A] 实时读取图片 (Image Mode) """
-        rgb_seq_dir = os.path.join(self.rgb_root, rel_seq_path)
-        if not os.path.isdir(rgb_seq_dir): return []
+    def _get_pkl_path(self, root, rel_path, file_type="rgb"):
+        """ 根据 Dataset 特性构建 PKL 文件路径 """
         
-        all_frames = sorted([f for f in os.listdir(rgb_seq_dir) if f.endswith('.jpg')])
-        if not all_frames: return []
+        # === A. SUSTech1K ===
+        if self.dataset_name == "SUSTECH1K":
+            dir_path = os.path.join(root, rel_path)
+            if not os.path.isdir(dir_path): return None
+            try:
+                files = [f for f in os.listdir(dir_path) if f.endswith('.pkl')]
+                if not files: return None
+                return os.path.join(dir_path, files[0])
+            except Exception:
+                return None
 
-        # 采样逻辑
+        # === B. CCPG ===
+        elif self.dataset_name == "CCPG":
+            if file_type == "rgb":
+                return os.path.join(root, rel_path)
+            elif file_type == "mask":
+                if "rgbs" in rel_path:
+                    new_rel_path = rel_path.replace("rgbs", "masks")
+                    return os.path.join(root, new_rel_path)
+                return os.path.join(root, rel_path.rsplit('.', 1)[0] + "_masks.pkl")
+
+        # === C. CASIA-B ===
+        else: 
+            return os.path.join(root, rel_path + ".pkl")
+
+    def _load_pkl(self, root, rel_path, file_type):
+        """ 读取 PKL """
+        path = self._get_pkl_path(root, rel_path, file_type)
+        if path is None or not os.path.exists(path): 
+            return None
+        try:
+            with open(path, 'rb') as f:
+                return pickle.load(f)
+        except Exception:
+            return None
+
+    def _load_dual_sequence(self, rel_seq_path):
+        # 1. 读取 RGB
+        rgb_list = self._load_pkl(self.rgb_root, rel_seq_path, file_type="rgb")
+        if rgb_list is None or len(rgb_list) == 0: 
+            return None
+        
+        # 2. 读取 Mask
+        mask_list = []
+        if self.use_mask:
+            mask_list = self._load_pkl(self.mask_root, rel_seq_path, file_type="mask")
+            if mask_list is not None and len(mask_list) > 0:
+                min_len = min(len(rgb_list), len(mask_list))
+                rgb_list = rgb_list[:min_len]
+                mask_list = mask_list[:min_len]
+            else:
+                mask_list = [] 
+
+        # 3. 采样 (🔥 核心修改：支持 "all")
+        total = len(rgb_list)
+        if total == 0: return None
+        
         if self.mode == 'train':
-            # 随机采样 (允许重复)
-            selected_frames = random.choices(all_frames, k=self.max_frames)
+            # 训练必须是 int
+            frames_to_sample = self.max_frames if isinstance(self.max_frames, int) else 30
+            indices = sorted([random.randint(0, total - 1) for _ in range(frames_to_sample)])
         else:
-            # 均匀采样
-            indices = np.linspace(0, len(all_frames) - 1, self.max_frames, dtype=int)
-            selected_frames = [all_frames[i] for i in indices]
+            # 测试支持 "all"
+            if self.max_frames == "all" or self.max_frames is all: # 兼容字符串和内置函数(防呆)
+                indices = np.arange(total)
+            else:
+                # 确保是 int
+                frames_to_sample = int(self.max_frames)
+                indices = np.linspace(0, total - 1, frames_to_sample, dtype=int)
 
-        images = []
-        for frame_name in selected_frames:
-            rgb_path = os.path.join(rgb_seq_dir, frame_name)
-            rgb_img = cv2.imread(rgb_path)
-            if rgb_img is None: 
-                # 坏图兜底: 返回黑图
-                images.append(Image.new('RGB', (224, 224)))
-                continue
-            rgb_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB)
-
-            # Mask 去背景逻辑 (仅当 use_mask=True 且文件存在时)
-            if self.use_mask:
-                mask_name = frame_name.replace('.jpg', '.png')
-                mask_path = os.path.join(self.mask_root, rel_seq_path, mask_name)
-                if os.path.exists(mask_path):
-                    mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-                    _, mask_img = cv2.threshold(mask_img, 127, 255, cv2.THRESH_BINARY)
-                    mask_img = mask_img.astype(np.float32) / 255.0
-                    mask_img = mask_img[:, :, np.newaxis]
-                    rgb_img = (rgb_img * mask_img).astype(np.uint8)
+        # 4. 融合与预处理
+        final_imgs = []
+        for idx in indices:
+            pil_img = rgb_list[idx]
             
-            pil_img = Image.fromarray(rgb_img)
+            # --- 维度与类型修正 ---
+            if isinstance(pil_img, np.ndarray):
+                # (3, H, W) -> (H, W, 3)
+                if pil_img.ndim == 3 and pil_img.shape[0] == 3:
+                    pil_img = pil_img.transpose(1, 2, 0)
+                # (1, H, W) -> (H, W)
+                elif pil_img.ndim == 3 and pil_img.shape[0] == 1:
+                    pil_img = pil_img.squeeze(0)
+                
+                if pil_img.dtype != np.uint8:
+                    pil_img = pil_img.astype(np.uint8)
+                pil_img = Image.fromarray(pil_img)
+
+            if self.use_mask and idx < len(mask_list):
+                pil_mask = mask_list[idx]
+                if isinstance(pil_mask, np.ndarray):
+                    if pil_mask.ndim == 3: pil_mask = pil_mask.squeeze()
+                    if pil_mask.dtype != np.uint8: pil_mask = pil_mask.astype(np.uint8)
+                    pil_mask = Image.fromarray(pil_mask, mode='L')
+
+                rgb_np = np.array(pil_img)
+                mask_np = np.array(pil_mask)
+                
+                if mask_np.ndim == 2:
+                    mask_np = mask_np[:, :, np.newaxis]
+                mask_np = (mask_np > 127).astype(np.float32)
+                
+                # Resize Mask if needed
+                if rgb_np.shape[:2] != mask_np.shape[:2]:
+                    pil_mask = pil_mask.resize((rgb_np.shape[1], rgb_np.shape[0]), Image.NEAREST)
+                    mask_np = np.array(pil_mask)
+                    mask_np = (mask_np > 127).astype(np.float32)[:, :, np.newaxis]
+
+                rgb_np = (rgb_np * mask_np).astype(np.uint8)
+                pil_img = Image.fromarray(rgb_np)
+            
             if self.transform:
                 pil_img = self.transform(pil_img)
-            images.append(pil_img)
             
-        return images
+            final_imgs.append(pil_img)
 
+        if len(final_imgs) > 0 and isinstance(final_imgs[0], torch.Tensor):
+            return torch.stack(final_imgs)
+            
+        return final_imgs
+    
     def _load_features(self, rel_seq_path):
-        """ [模式 B] 读取预提取特征 (Feature Mode) """
-        # 路径拼凑: root/001/nm-01/090.pt
-        feat_path = os.path.join(self.feature_root, rel_seq_path + ".pt")
-        
-        if not os.path.exists(feat_path): return None
-        
-        # map_location='cpu' 防止多进程 DataLoader 导致显存溢出
-        features = torch.load(feat_path, map_location='cpu')
-        total = features.size(0)
-        
+        # Feature Mode
+        path = os.path.join(self.feature_root, rel_seq_path + ".pt")
+        if not os.path.exists(path): return None
+        data = torch.load(path, map_location='cpu')
+        total = data.size(0)
         if total == 0: return None
-
-        # 采样逻辑
+        
         if self.mode == 'train':
-            # 训练：随机采样 N 帧
-            if total >= self.max_frames:
-                indices = sorted(random.sample(range(total), self.max_frames))
-            else:
-                indices = sorted(random.choices(range(total), k=self.max_frames))
-            return features[indices] # [N, 512]
+            frames_to_sample = self.max_frames if isinstance(self.max_frames, int) else 30
+            indices = sorted([random.randint(0, total - 1) for _ in range(frames_to_sample)])
         else:
-            # 测试：返回所有特征 (或者也可以做均匀采样)
-            return features # [Total, 512]
+            # 🔥 支持 "all"
+            if self.max_frames == "all" or self.max_frames is all:
+                indices = np.arange(total)
+            else:
+                frames_to_sample = int(self.max_frames)
+                indices = np.linspace(0, total - 1, frames_to_sample, dtype=int)
+                
+        return data[indices]
 
     def __getitem__(self, idx):
-        item = self.data[idx]
-        try:
-            # === 1. 视觉数据加载 ===
-            if self.use_features:
-                ref_out = self._load_features(item['ref']['seq_path'])
-                tar_out = self._load_features(item['tar']['seq_path'])
-                if ref_out is None or tar_out is None:
-                    raise ValueError(f"Missing features for {item['sid']}")
-            else:
-                ref_out = self._load_frames(item['ref']['seq_path'])
-                tar_out = self._load_frames(item['tar']['seq_path'])
+        retries = 0
+        max_retries = 20
+        
+        while True:
+            if retries > max_retries:
+                raise RuntimeError(f"❌ Failed to load data after {max_retries} attempts.")
+                
+            item = self.data[idx]
+            try:
+                if self.use_features:
+                    ref_out = self._load_features(item['ref']['seq_path'])
+                    tar_out = self._load_features(item['tar']['seq_path'])
+                else:
+                    ref_out = self._load_dual_sequence(item['ref']['seq_path'])
+                    tar_out = self._load_dual_sequence(item['tar']['seq_path'])
 
-            # === 2. 文本指令处理 ===
-            # 正向指令 (Ref -> Tar)
-            caption = item['caption'].replace("{subject}", self.subject_token)
-            
-            # 逆向指令 (Tar -> Ref, 用于 Cycle Loss)
-            raw_inv = item.get('caption_inv', "")
-            caption_inv = raw_inv.replace("{subject}", self.subject_token) if raw_inv else ""
-            
-            result = {
-                "ref_imgs": ref_out, # Tensor[T, 512] 或 List[PIL]
-                "tar_imgs": tar_out,
-                "text": caption,
-                "text_inv": caption_inv,
-                "task": item['task'],
+                if ref_out is None or tar_out is None:
+                    raise ValueError(f"Missing data")
+
+                caption = item['caption'].replace("{subject}", self.subject_token)
+                raw_inv = item.get('caption_inv', "")
+                caption_inv = raw_inv.replace("{subject}", self.subject_token) if raw_inv else ""
                 
-                # 元数据 (用于测试评估)
-                "sid": str(item['sid']),
-                "cond": str(item['tar']['condition']),
-                "view": str(item['tar']['view'])
-            }
-            
-            # 静态描述 (可选)
-            if self.return_static:
-                result["ref_text"] = item['ref'].get('static_caption', "").replace("{subject}", self.subject_token)
-                result["tar_text"] = item['tar'].get('static_caption', "").replace("{subject}", self.subject_token)
+                result = {
+                    "ref_imgs": ref_out, "tar_imgs": tar_out,
+                    "text": caption, "text_inv": caption_inv,
+                    "task": item['task'], "sid": str(item['sid']),
+                    "cond": str(item['tar']['condition']), "view": str(item['tar']['view'])
+                }
+                if self.return_static:
+                    result["ref_text"] = item['ref'].get('static_caption', "").replace("{subject}", self.subject_token)
+                    result["tar_text"] = item['tar'].get('static_caption', "").replace("{subject}", self.subject_token)
                 
-            return result
+                return result 
             
-        except Exception:
-            # 训练时如果遇到坏数据，随机重试另一个，保证 Robustness
-            return self.__getitem__(random.randint(0, len(self.data)-1))
+            except Exception as e:
+                if self.mode == 'train':
+                    idx = random.randint(0, len(self.data) - 1)
+                    retries += 1
+                else:
+                    raise 
 
     def __len__(self):
         return len(self.data)

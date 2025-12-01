@@ -26,7 +26,8 @@ class Combiner(nn.Module):
         combined = torch.cat((img_feat, txt_feat), dim=-1)
         delta = self.layers(combined)
         # Residual Connection
-        return img_feat + self.alpha * delta
+        output = img_feat + self.alpha * delta
+        return F.normalize(output, dim=-1)
 
 class GaitCIRModel(nn.Module):
     def __init__(self, model_id="openai/clip-vit-base-patch32"):
@@ -49,13 +50,13 @@ class GaitCIRModel(nn.Module):
         """ 单帧特征提取: [N, 3, H, W] -> [N, 512] """
         with torch.no_grad():
             feat = self.clip.get_image_features(pixel_values)
-        return feat / feat.norm(dim=-1, keepdim=True)
+        return F.normalize(feat, dim=-1)
 
     def extract_txt_feature(self, input_ids, attention_mask):
         """ 文本特征提取: [B, L] -> [B, 512] """
         with torch.no_grad():
             feat = self.clip.get_text_features(input_ids, attention_mask)
-        return feat / feat.norm(dim=-1, keepdim=True)
+        return F.normalize(feat, dim=-1)
 
     def aggregate_features(self, inputs, batch_size, frames_num):
         """
@@ -77,7 +78,7 @@ class GaitCIRModel(nn.Module):
         agg_feat = features.max(dim=1)[0] # -> [B, 512]
         
         # 4. ⚠️ 再次归一化 (Pooling 后模长会变，必须 Re-Norm)
-        agg_feat = agg_feat / agg_feat.norm(dim=-1, keepdim=True)
+        agg_feat = F.normalize(agg_feat, dim=-1)
         
         return agg_feat
 
@@ -110,4 +111,4 @@ class GaitCIRModel(nn.Module):
         query_feat = self.combiner(ref_agg, txt_feat)
         
         # 输出归一化
-        return query_feat / query_feat.norm(dim=-1, keepdim=True)
+        return query_feat

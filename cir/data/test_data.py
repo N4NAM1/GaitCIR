@@ -1,11 +1,14 @@
 import torch
 import os
+import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor
-from dataset_loader import GaitCIRDataset
-import matplotlib.pyplot as plt
+import numpy as np
 
-# 模拟 CLIP 的预处理 (不带 Normalize 以便可视化)
+# 假设你的 Dataset 文件名为 dataset_loader.py
+from dataset_loader import GaitCIRDataset
+
+# 模拟预处理
 simple_transform = Compose([
     Resize(224, interpolation=3),
     CenterCrop(224),
@@ -13,92 +16,121 @@ simple_transform = Compose([
 ])
 
 def test():
-    print("🚀 开始 DataLoader 冒烟测试...")
+    print("🚀 开始 DataLoader 通用冒烟测试...")
+
+    # ================= ⚙️ 数据集配置区域 =================
+    # 你可以在这里修改路径，然后通过修改 CURRENT_DATASET 变量来切换
     
-    # ================= 配置区域 =================
-    MASTER_JSON = '../../datasets/GaitCIR_RGB/casiab_cir_final.json'
-    SPLIT_CONFIG = '../../datasets/GaitCIR_RGB/Split/CASIA-B.json'
-    MODE = 'train' # 测试训练集数据
+    DATASET_CONFIGS = {
+        "CASIA-B": {
+            "ROOT": "/root/autodl-tmp/CASIA-B-Processed",
+            "JSON": "/root/work/GaitCIR/datasets/CASIA-B_RGB_JSON/CASIA-B/casiab_cir_final.json",
+            "NAME": "CASIA-B"
+        },
+        "CCPG": {
+            "ROOT": "/root/autodl-tmp/CCPG_Processed",
+            "JSON": "/root/work/GaitCIR/datasets/CCPG_RGB_JSON/CCPG/ccpg_cir_final.json", # 请替换真实路径
+            "NAME": "CCPG"
+        },
+        "SUSTech1K": {
+            "ROOT": "/root/autodl-tmp/SUSTech1K_Processed",
+            "JSON": "path/to/sustech1k_cir_final.json", # 请替换真实路径
+            "NAME": "SUSTech1K"
+        }
+    }
+
+    # 🔥 在这里切换你要测试的数据集！
+    CURRENT_DATASET = "CASIA-B"  # 选项: "CASIA-B", "CCPG", "SUSTech1K"
+ # =======================================================
+
+    cfg = DATASET_CONFIGS[CURRENT_DATASET]
+    print(f"📂 当前测试目标: {cfg['NAME']}")
+
+    # 1. 初始化 Dataset
+    try:
+        dataset = GaitCIRDataset(
+            json_path=cfg["JSON"],
+            data_root=cfg["ROOT"],
+            dataset_name=cfg["NAME"],
+            mode='train',
+            max_frames=16,                   
+            transform=simple_transform,
+            subject_token="the person",
+            return_static=True,
+            use_mask=False,                 
+            use_features=False
+        )
+    except Exception as e:
+        print(f"\n❌ Dataset 初始化失败！错误信息:\n{e}")
+        return
+
+    print(f"✅ Dataset 加载成功，数据总量: {len(dataset)}")
     
-    # 初始化 Dataset
-    dataset = GaitCIRDataset(
-        json_path=MASTER_JSON,
-        data_root='../../datasets/CASIA-B-Processed',
-        split_config_path=SPLIT_CONFIG, # 传入分割配置
-        mode=MODE,                      # 指定模式
-        max_frames=1,                   # 训练模式下只采单帧
-        transform=simple_transform,
-        subject_token="the person",
-        return_static=True              # 必须为 True 才能打印静态描述
-    )
-    
+    # 2. 初始化 DataLoader
     loader = DataLoader(dataset, batch_size=4, shuffle=True)
     
-    # 读取一个 Batch
+    # 3. 读取一个 Batch
+    print("⏳ 正在读取第一个 Batch...")
     try:
         batch = next(iter(loader))
     except Exception as e:
-        print(f"❌ DataLoader 读取失败: {e}")
+        print(f"\n❌ DataLoader 读取失败！错误信息:\n{e}")
         return
 
-    # --- 打印调试信息 ---
+    # --- 打印详细信息 ---
     print("\n" + "="*40)
-    print(f"🔍 Batch Keys: {list(batch.keys())}")
     
-    # 检查形状
-    # 训练模式下应该是 [4, 3, 224, 224]
-    # 测试模式下应该是 [4, 8, 3, 224, 224] (List of Tensors 或 Stacked Tensor)
+    # 提取 Ref 和 Tar 数据
     ref_data = batch['ref_imgs']
-    if isinstance(ref_data, list):
-        print(f"🖼️ Ref Image (List): Length {len(ref_data)}, Item Shape {ref_data[0].shape}")
-        #如果是列表取第一帧用于可视化
-        ref_tensor = ref_data[0]
-        tar_tensor = batch['tar_imgs'][0]
-    else:
-        print(f"🖼️ Ref Image (Tensor): Shape {ref_data.shape}")
-        ref_tensor = batch['ref_imgs'][0]
-        tar_tensor = batch['tar_imgs'][0]
+    tar_data = batch['tar_imgs'] # 🔥 新增 Target 读取
+    
+    print(f"🖼️ Ref Shape: {ref_data.shape}") 
+    print(f"🖼️ Tar Shape: {tar_data.shape}") # 🔥 打印 Target 形状
+    
+    # 处理数据维度用于可视化 (取出 Batch 0, Frame 0)
+    def get_first_img(tensor_data):
+        if tensor_data.dim() == 5: # [B, T, C, H, W]
+            return tensor_data[0][0]
+        else: # [B, C, H, W]
+            return tensor_data[0]
 
+    ref_tensor = get_first_img(ref_data)
+    tar_tensor = get_first_img(tar_data)
+
+    # 打印文本和元数据
+    sid = batch['sid'][0]
+    view = batch['view'][0]
+    cond = batch['cond'][0]
+    text = batch['text'][0]
+    
+    print(f"📌 Subject ID: {sid}")
+    print(f"📌 View Angle: {view}")
+    print(f"📌 Condition:  {cond}")
+    print(f"📝 Instruction: {text}")
     print("-" * 40)
+
+    # --- 可视化对比 (Ref vs Target) ---
+    ref_np = ref_tensor.permute(1, 2, 0).numpy()
+    tar_np = tar_tensor.permute(1, 2, 0).numpy()
     
-    # 打印文本 (检查占位符替换)
-    print(f"📝 Instruction: {batch['text'][0]}")
-    print(f"📝 Instruction_inv: {batch['text_inv'][0]}")
+    plt.figure(figsize=(10, 5))
     
-    # 检查静态描述是否存在
-    if 'ref_text' in batch:
-        print(f"🏷️ Ref Static:  {batch['ref_text'][0]}")
-        print(f"🏷️ Tar Static:  {batch['tar_text'][0]}")
-    else:
-        print("⚠️ Warning: 'ref_text' not found. Did you set return_static=True?")
-        
-    print(f"📌 Task Type:   {batch['task'][0]}")
-    print(f"🆔 Subject ID:  {batch.get('sid', 'N/A')[0]}")
-    print(f"🎨 Condition:   {batch.get('cond', 'N/A')[0]}")
-    print("-" * 40)
-    
-    # --- 可视化检查 ---
-    # Tensor (C, H, W) -> Numpy (H, W, C)
-    ref_img = ref_tensor.permute(1, 2, 0).numpy()
-    tar_img = tar_tensor.permute(1, 2, 0).numpy()
-    
-    plt.figure(figsize=(12, 6))
-    
+    # 绘制 Reference
     plt.subplot(1, 2, 1)
-    plt.title(f"Ref: {batch['text'][0][:30]}...")
-    plt.imshow(ref_img)
+    plt.imshow(ref_np)
+    plt.title(f"Reference Image\n{text[:20]}...") # 显示部分指令
     plt.axis('off')
-    
+
+    # 绘制 Target
     plt.subplot(1, 2, 2)
-    plt.title(f"Target\n(Should match instruction)")
-    plt.imshow(tar_img)
+    plt.imshow(tar_np)
+    plt.title(f"Target Image\nID: {sid} | View: {view}")
     plt.axis('off')
     
-    save_path = "loader_check.png"
+    save_path = f"check_{cfg['NAME']}_pair.png"
     plt.savefig(save_path)
-    print(f"✅ 可视化结果已保存至 {save_path}")
-    print("   -> 请检查背景是否为全黑 (Masked RGB)")
-    print("   -> 请检查 Ref 和 Tar 是否符合文本描述")
+    print(f"✅ 可视化对比图已保存至: {save_path}")
+    print("👀 请检查：Ref 和 Target 是否看起来是同一个人？(Identity Consistency)")
 
 if __name__ == '__main__':
     test()
